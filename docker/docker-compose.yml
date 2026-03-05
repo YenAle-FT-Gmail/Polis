@@ -1,0 +1,62 @@
+# polis/docker/docker-compose.yml
+#
+# Multi-node local test environment for Polis.
+# Spins up two Polis nodes that can discover each other.
+#
+# Usage:
+#   docker compose up --build
+#   docker compose down -v
+
+services:
+  polis-node-a:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    ports:
+      - "8001:8000"
+    environment:
+      POLIS_NODE_ID: node-a
+      POLIS_STORAGE_BACKEND: local
+      POLIS_DATA_DIR: /data/polis
+      POLIS_PEERS: "polis-node-b:8000"
+      POLIS_LOG_LEVEL: INFO
+    volumes:
+      - node-a-data:/data/polis
+    networks:
+      - polis-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/node/status" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  polis-node-b:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    ports:
+      - "8002:8000"
+    environment:
+      POLIS_NODE_ID: node-b
+      POLIS_STORAGE_BACKEND: local
+      POLIS_DATA_DIR: /data/polis
+      POLIS_PEERS: "polis-node-a:8000"
+      POLIS_LOG_LEVEL: INFO
+    volumes:
+      - node-b-data:/data/polis
+    networks:
+      - polis-net
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/node/status" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  node-a-data:
+  node-b-data:
+
+
+networks:
+  polis-net:
+    driver: bridge

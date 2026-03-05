@@ -1,0 +1,36 @@
+# polis/docker/Dockerfile.node
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN pip install --no-cache-dir poetry==1.8.2
+
+WORKDIR /app
+
+# Copy dependency files first for caching
+COPY node/pyproject.toml node/poetry.lock* /app/
+
+# Install Python dependencies
+RUN poetry config virtualenvs.create false \
+    && poetry install --no-interaction --no-ansi --no-root
+
+# Copy application code
+COPY node/ /app/
+
+# Install the polis_node package
+RUN poetry install --no-interaction --no-ansi
+
+# Expose the API port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:8000/node/status || exit 1
+
+# Run the Polis node
+CMD ["python", "-m", "polis_node"]

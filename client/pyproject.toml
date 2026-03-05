@@ -1,0 +1,21 @@
+# polis/client/pyproject.toml
+[tool.poetry]
+name = "polis-client"
+version = "0.1.0"
+description = "Polis protocol client library"
+authors = ["Polis Contributors"]
+readme = "README.md"
+packages = [{ include = "polis_client" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = ">=0.25"
+pydantic = ">=2.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0"
+pytest-asyncio = ">=0.21"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
