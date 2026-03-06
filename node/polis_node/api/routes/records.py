@@ -123,31 +123,17 @@ class RevokeAccessRequest(BaseModel):
 class AccessRecordRequest(BaseModel):
     """Request body for presenting a permission token to access content.
 
+    The server validates the token and returns the encrypted payload
+    together with the cryptographic parameters needed for **client-side**
+    decryption.  The recipient's private key never leaves the client.
+
     Attributes:
         token_id: The permission token ID.
         recipient_did: The recipient's DID (must match the token).
-        wrapped_key: Hex-encoded wrapped AES key from the PermissionToken.
-        wrap_nonce: Hex-encoded wrap nonce from the PermissionToken.
-        record_nonce: Hex-encoded record encryption nonce.
-        record_salt: Hex-encoded record encryption salt.
-        recipient_private_key_hex: Hex-encoded recipient private key seed
-            (NOTE: in production, decryption would happen client-side;
-            this is for the v0.1 PoC demonstration only).
-        grantor_public_key_hex: Hex-encoded grantor public key.
     """
 
     token_id: str
     recipient_did: str
-    wrapped_key: str = Field(description="Hex-encoded wrapped AES key")
-    wrap_nonce: str = Field(description="Hex-encoded wrap nonce")
-    record_nonce: str = Field(description="Hex-encoded record nonce")
-    record_salt: str = Field(description="Hex-encoded record salt")
-    recipient_private_key_hex: str = Field(
-        description="Hex-encoded recipient Ed25519 private key (PoC only)"
-    )
-    grantor_public_key_hex: str = Field(
-        description="Hex-encoded grantor Ed25519 public key"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +396,9 @@ async def grant_access(
             },
         )
 
+    # Store the full token object so /access can retrieve crypto params
+    state.store_permission_token(token)
+
     logger.info(
         "api.record.access_granted",
         cid=cid,
@@ -607,10 +596,11 @@ async def ingest_record(
 
 @router.post(
     "/{cid}/access",
-    summary="Present a permission token to access content",
+    summary="Present a permission token to access encrypted content",
     description=(
-        "Decrypt and return the content of a selective-visibility record "
-        "using a valid permission token."
+        "Validate a permission token and return the encrypted payload "
+        "together with cryptographic parameters for client-side decryption. "
+        "The server never sees the recipient's private key."
     ),
 )
 async def access_record(
@@ -618,31 +608,31 @@ async def access_record(
     request: AccessRecordRequest,
     state: NodeState = Depends(get_node_state),
 ) -> dict:
-    """Present a permission token to decrypt selective-visibility content.
+    """Validate a permission token and return encrypted content.
 
-    In v0.1, this endpoint accepts the recipient's private key for
-    server-side decryption as a PoC.  In production, decryption would
-    occur client-side.
+    The endpoint checks that the token is valid for the requested
+    record and returns the ciphertext plus the wrapped-key envelope
+    so that the **client** can perform decryption locally.
 
     Args:
         cid: The record's CID.
-        request: The access request with token details.
+        request: Token ID and recipient DID.
         state: Injected node state.
 
     Returns:
-        The decrypted payload (base64-encoded).
+        A dict containing:
+        - cid: The content identifier.
+        - ciphertext: Base64-encoded encrypted payload.
+        - wrapped_key: Hex-encoded wrapped AES key.
+        - wrap_nonce: Hex-encoded wrap nonce.
+        - record_nonce: Hex-encoded record encryption nonce.
+        - record_salt: Hex-encoded record encryption salt.
+        - grantor_public_key_hex: Hex-encoded grantor public key.
 
     Raises:
-        HTTPException: 404 if the record is not found.
+        HTTPException: 404 if the record or data is not found.
         HTTPException: 403 if the token is invalid or revoked.
-        HTTPException: 400 if decryption fails.
     """
-    from polis_node.attribution.record import (
-        _unwrap_key_for_recipient,
-        _derive_encryption_key,
-        HKDF_INFO_PRIVATE,
-    )
-
     record = state.get_record(cid)
     if record is None:
         raise HTTPException(
@@ -656,21 +646,15 @@ async def access_record(
             detail={"error": "invalid_token", "message": "Token is not valid for this record."},
         )
 
-    # Unwrap the AES key
-    try:
-        aes_key = _unwrap_key_for_recipient(
-            wrapped_key=bytes.fromhex(request.wrapped_key),
-            wrap_nonce=bytes.fromhex(request.wrap_nonce),
-            recipient_private=bytes.fromhex(request.recipient_private_key_hex),
-            grantor_public=bytes.fromhex(request.grantor_public_key_hex),
-        )
-    except Exception as exc:
+    # Look up the token metadata from the node state
+    token = state.get_permission_token(request.token_id)
+    if token is None:
         raise HTTPException(
-            status_code=400,
-            detail={"error": "key_unwrap_failed", "message": f"Failed to unwrap key: {exc}"},
+            status_code=403,
+            detail={"error": "invalid_token", "message": "Token metadata not found."},
         )
 
-    # Decrypt the ciphertext
+    # Retrieve stored ciphertext
     ciphertext = state.record_data.get(cid)
     if ciphertext is None:
         raise HTTPException(
@@ -678,21 +662,19 @@ async def access_record(
             detail={"error": "data_not_found", "message": "Record data not available on this node."},
         )
 
-    try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-        nonce = bytes.fromhex(request.record_nonce)
-        aesgcm = AESGCM(aes_key)
-        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "decryption_failed", "message": f"Failed to decrypt content: {exc}"},
-        )
-
     logger.info("api.record.accessed", cid=cid, recipient_did=request.recipient_did)
+
+    # Return everything the client needs for local decryption
+    # Resolve the grantor's public key so the client can perform ECDH
+    grantor_pub = state.resolver.get_signing_public_key(token.grantor_did)
+    grantor_pub_hex = grantor_pub.hex() if grantor_pub else ""
 
     return {
         "cid": cid,
-        "payload": base64.b64encode(plaintext).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "wrapped_key": token.wrapped_key.hex() if isinstance(token.wrapped_key, bytes) else token.wrapped_key,
+        "wrap_nonce": token.wrap_nonce.hex() if isinstance(token.wrap_nonce, bytes) else token.wrap_nonce,
+        "record_nonce": token.record_nonce.hex() if isinstance(token.record_nonce, bytes) else token.record_nonce,
+        "record_salt": token.record_salt.hex() if isinstance(token.record_salt, bytes) else token.record_salt,
+        "grantor_public_key_hex": grantor_pub_hex,
     }

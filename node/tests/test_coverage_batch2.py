@@ -261,12 +261,6 @@ class TestAccessEndpoint:
             json={
                 "token_id": "t",
                 "recipient_did": "did:polis:x",
-                "wrapped_key": "aa",
-                "wrap_nonce": "bb",
-                "record_nonce": "cc",
-                "record_salt": "dd",
-                "recipient_private_key_hex": "ee",
-                "grantor_public_key_hex": "ff",
             },
         )
         assert resp.status_code == 404
@@ -286,18 +280,12 @@ class TestAccessEndpoint:
             json={
                 "token_id": "bad_token",
                 "recipient_did": "did:polis:x",
-                "wrapped_key": "aa",
-                "wrap_nonce": "bb",
-                "record_nonce": "cc",
-                "record_salt": "dd",
-                "recipient_private_key_hex": "ee",
-                "grantor_public_key_hex": "ff",
             },
         )
         assert resp.status_code == 403
 
     def test_access_full_decrypt_flow(self, setup) -> None:
-        """Full flow: create selective record → grant → access → decrypt."""
+        """Full flow: create selective record → grant → access → get encrypted envelope."""
         client, state, author = setup
         recipient = PolisIdentity.create()
         state.register_identity(recipient)
@@ -328,26 +316,42 @@ class TestAccessEndpoint:
         assert grant_resp.status_code == 200
         grant_data = grant_resp.json()
 
-        # 3. Access with the token
+        # 3. Access with the token — server returns encrypted envelope
         access_resp = client.post(
             f"/records/{cid}/access",
             json={
                 "token_id": grant_data["token_id"],
                 "recipient_did": recipient.did,
-                "wrapped_key": base64.b64decode(grant_data["wrapped_key"]).hex(),
-                "wrap_nonce": base64.b64decode(grant_data["wrap_nonce"]).hex(),
-                "record_nonce": grant_data["record_nonce"],
-                "record_salt": grant_data["record_salt"],
-                "recipient_private_key_hex": recipient.signing_key_private.hex(),
-                "grantor_public_key_hex": author.signing_key_public.hex(),
             },
         )
         assert access_resp.status_code == 200
-        decrypted = base64.b64decode(access_resp.json()["payload"])
-        assert decrypted == original_payload
+        envelope = access_resp.json()
+        assert "ciphertext" in envelope
+        assert "wrapped_key" in envelope
+        assert "wrap_nonce" in envelope
+        assert "record_nonce" in envelope
+        assert "record_salt" in envelope
+        assert "grantor_public_key_hex" in envelope
+        # Verify ciphertext is non-empty base64
+        ct_bytes = base64.b64decode(envelope["ciphertext"])
+        assert len(ct_bytes) > 0
+
+        # 4. Client-side decryption to verify the full chain
+        from polis_node.attribution.record import _unwrap_key_for_recipient
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        aes_key = _unwrap_key_for_recipient(
+            wrapped_key=bytes.fromhex(envelope["wrapped_key"]),
+            wrap_nonce=bytes.fromhex(envelope["wrap_nonce"]),
+            recipient_private=recipient.signing_key_private,
+            grantor_public=bytes.fromhex(envelope["grantor_public_key_hex"]),
+        )
+        nonce = bytes.fromhex(envelope["record_nonce"])
+        plaintext = AESGCM(aes_key).decrypt(nonce, ct_bytes, None)
+        assert plaintext == original_payload
 
     def test_access_key_unwrap_failure(self, setup) -> None:
-        """Bad key data causes key_unwrap_failed error."""
+        """Token not stored in state → token metadata not found."""
         client, state, author = setup
         recipient = PolisIdentity.create()
         state.register_identity(recipient)
@@ -370,25 +374,21 @@ class TestAccessEndpoint:
         )
         token_id = grant_resp.json()["token_id"]
 
-        # Use wrong keys to trigger unwrap failure
-        wrong = PolisIdentity.create()
+        # Remove the token object from state to simulate missing metadata
+        state.permission_token_objects.pop(token_id, None)
+
         access_resp = client.post(
             f"/records/{cid}/access",
             json={
                 "token_id": token_id,
                 "recipient_did": recipient.did,
-                "wrapped_key": "aa" * 48,
-                "wrap_nonce": "bb" * 12,
-                "record_nonce": "cc" * 12,
-                "record_salt": "dd" * 16,
-                "recipient_private_key_hex": wrong.signing_key_private.hex(),
-                "grantor_public_key_hex": wrong.signing_key_public.hex(),
             },
         )
-        assert access_resp.status_code == 400
+        assert access_resp.status_code == 403
+        assert access_resp.json()["detail"]["error"] == "invalid_token"
 
     def test_access_decryption_failure(self, setup) -> None:
-        """Valid key unwrap but wrong ciphertext triggers decryption_failed."""
+        """Tampered ciphertext → client would fail, but server returns envelope intact."""
         client, state, author = setup
         recipient = PolisIdentity.create()
         state.register_identity(recipient)
@@ -419,16 +419,14 @@ class TestAccessEndpoint:
             json={
                 "token_id": grant_data["token_id"],
                 "recipient_did": recipient.did,
-                "wrapped_key": base64.b64decode(grant_data["wrapped_key"]).hex(),
-                "wrap_nonce": base64.b64decode(grant_data["wrap_nonce"]).hex(),
-                "record_nonce": grant_data["record_nonce"],
-                "record_salt": grant_data["record_salt"],
-                "recipient_private_key_hex": recipient.signing_key_private.hex(),
-                "grantor_public_key_hex": author.signing_key_public.hex(),
             },
         )
-        assert access_resp.status_code == 400
-        assert access_resp.json()["detail"]["error"] == "decryption_failed"
+        # Server now returns 200 with the tampered data; decryption failure is client-side
+        assert access_resp.status_code == 200
+        envelope = access_resp.json()
+        # The ciphertext is the tampered data
+        ct = base64.b64decode(envelope["ciphertext"])
+        assert ct == b"tampered ciphertext data"
 
 
 # ---------------------------------------------------------------------------

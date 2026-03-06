@@ -21,7 +21,7 @@ import structlog
 from polis_node.config.settings import PolisNodeSettings
 from polis_node.identity.did import DIDResolver, PolisIdentity
 from polis_node.identity.persistence import save_identity, load_identity
-from polis_node.attribution.record import AttributionRecord
+from polis_node.attribution.record import AttributionRecord, PermissionToken
 from polis_node.storage.interface import StorageBackend
 from polis_node.storage.local import LocalStorageBackend
 from polis_node.moderation.engine import ModerationEngine
@@ -64,6 +64,7 @@ class NodeState:
         self.identities: dict[str, PolisIdentity] = {}
         self.records: dict[str, AttributionRecord] = {}
         self.record_data: dict[str, bytes] = {}  # CID -> raw payload/ciphertext
+        self.permission_token_objects: dict[str, PermissionToken] = {}  # token_id -> PermissionToken
         self.peers: list[str] = list(settings.peers)  # Mutable copy of initial peers
         self.moderation = ModerationEngine()
         self._started_at: float = time.monotonic()
@@ -96,7 +97,7 @@ class NodeState:
     async def initialize(self) -> None:
         """Initialize the node state (called during application startup).
 
-        Loads persisted identities from disk and sets up storage.
+        Loads persisted identities and records from disk and sets up storage.
         """
         logger.info(
             "node_state.initialize",
@@ -104,13 +105,26 @@ class NodeState:
             storage_backend=self.settings.storage_backend,
         )
         self._started_at = time.monotonic()
+        # Warn if identity passphrase is empty
+        if not self.settings.identity_passphrase:
+            logger.warning(
+                "node_state.empty_passphrase",
+                msg=(
+                    "POLIS_IDENTITY_PASSPHRASE is not set. "
+                    "Identities will NOT be persisted across restarts. "
+                    "Set a strong passphrase in production."
+                ),
+            )
         # Load persisted identities from encrypted files
         self._load_persisted_identities()
+        # Load persisted records
+        self._load_persisted_records()
 
     async def shutdown(self) -> None:
         """Graceful shutdown — persist state before exit."""
         logger.info("node_state.shutdown", identity_count=len(self.identities))
         self._persist_identities()
+        self._persist_records()
 
     def _load_persisted_identities(self) -> None:
         """Load all encrypted identity files from POLIS_IDENTITY_DIR."""
@@ -145,6 +159,49 @@ class NodeState:
             except Exception as exc:
                 logger.error("identity.persist_failed", did=did, error=str(exc))
 
+    # ------------------------------------------------------------------
+    # Record persistence
+    # ------------------------------------------------------------------
+
+    def _load_persisted_records(self) -> None:
+        """Load persisted records and their data from disk."""
+        records_dir = Path(self.settings.data_dir) / "records"
+        if not records_dir.exists():
+            return
+        for meta_fp in records_dir.glob("*.meta.json"):
+            try:
+                meta = json.loads(meta_fp.read_text(encoding="utf-8"))
+                record = AttributionRecord.from_dict(meta)
+                data_fp = meta_fp.with_suffix("").with_suffix(".data")
+                if data_fp.exists():
+                    payload = base64.b64decode(data_fp.read_text(encoding="utf-8"))
+                else:
+                    payload = b""
+                self.records[record.cid] = record
+                self.record_data[record.cid] = payload
+                logger.info("record.restored", cid=record.cid)
+            except Exception as exc:
+                logger.error("record.restore_failed", path=str(meta_fp), error=str(exc))
+
+    def _persist_records(self) -> None:
+        """Persist all records and their data to disk."""
+        records_dir = Path(self.settings.data_dir) / "records"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        for cid, record in self.records.items():
+            try:
+                safe_cid = cid.replace("/", "_")
+                meta_fp = records_dir / f"{safe_cid}.meta.json"
+                meta_fp.write_text(
+                    json.dumps(record.to_dict()), encoding="utf-8"
+                )
+                data_fp = records_dir / f"{safe_cid}.data"
+                payload = self.record_data.get(cid, b"")
+                data_fp.write_text(
+                    base64.b64encode(payload).decode("ascii"), encoding="utf-8"
+                )
+            except Exception as exc:
+                logger.error("record.persist_failed", cid=cid, error=str(exc))
+
     def register_identity(self, identity: PolisIdentity) -> None:
         """Register a new identity in the node state.
 
@@ -154,6 +211,25 @@ class NodeState:
         self.identities[identity.did] = identity
         self.resolver.register(identity)
         logger.info("identity.registered", did=identity.did)
+
+    def store_permission_token(self, token: PermissionToken) -> None:
+        """Store a permission token object for later retrieval.
+
+        Args:
+            token: The PermissionToken to store.
+        """
+        self.permission_token_objects[token.token_id] = token
+
+    def get_permission_token(self, token_id: str) -> Optional[PermissionToken]:
+        """Look up a permission token by ID.
+
+        Args:
+            token_id: The token identifier.
+
+        Returns:
+            The PermissionToken if found, None otherwise.
+        """
+        return self.permission_token_objects.get(token_id)
 
     def get_identity(self, did: str) -> Optional[PolisIdentity]:
         """Look up an identity by DID.

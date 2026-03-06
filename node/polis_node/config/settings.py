@@ -71,7 +71,7 @@ class PolisNodeSettings:
     log_level: str = DEFAULT_LOG_LEVEL
     ipfs_api_url: str = "http://localhost:5001"
     arweave_gateway_url: str = "https://arweave.net"
-    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    cors_origins: list[str] = field(default_factory=list)
     identity_passphrase: str = ""
 
     @classmethod
@@ -95,7 +95,7 @@ class PolisNodeSettings:
         peers_raw = os.environ.get("POLIS_PEERS", "")
         peers = [p.strip() for p in peers_raw.split(",") if p.strip()]
 
-        cors_raw = os.environ.get("POLIS_CORS_ORIGINS", "*")
+        cors_raw = os.environ.get("POLIS_CORS_ORIGINS", "")
         cors_origins = [o.strip() for o in cors_raw.split(",") if o.strip()]
 
         return cls(

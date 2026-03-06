@@ -201,3 +201,80 @@ class TestStateModerationIntegration:
         result = state.moderation.screen(b"clean data")
         from polis_node.moderation.engine import ModerationVerdict
         assert result.verdict == ModerationVerdict.PASS
+
+
+# ---------------------------------------------------------------------------
+# Record persistence
+# ---------------------------------------------------------------------------
+
+
+class TestRecordPersistence:
+    """Tests for record persistence on shutdown/restore."""
+
+    @pytest.mark.asyncio
+    async def test_persist_and_restore_records(self, tmp_path: Path) -> None:
+        data_dir = str(tmp_path / "data")
+        passphrase = "test-pw"
+        id_dir = str(tmp_path / "identities")
+
+        state1 = _make_state(data_dir=data_dir, identity_dir=id_dir, identity_passphrase=passphrase)
+        await state1.initialize()
+        ident = PolisIdentity.create()
+        state1.register_identity(ident)
+
+        import base64
+        from polis_node.attribution.record import AttributionRecord
+
+        record, storable = AttributionRecord.create(
+            payload=b"hello world",
+            author=ident,
+            record_type="polis.content.post",
+            visibility="public",
+        )
+        await state1.store_record(record, storable)
+        await state1.shutdown()
+
+        # Records dir should exist
+        records_dir = Path(data_dir) / "records"
+        assert records_dir.exists()
+        meta_files = list(records_dir.glob("*.meta.json"))
+        assert len(meta_files) == 1
+
+        # New state should restore the record
+        state2 = _make_state(data_dir=data_dir, identity_dir=id_dir, identity_passphrase=passphrase)
+        await state2.initialize()
+        assert record.cid in state2.records
+        assert state2.record_data[record.cid] == storable
+
+    @pytest.mark.asyncio
+    async def test_persist_records_empty(self, tmp_path: Path) -> None:
+        data_dir = str(tmp_path / "data")
+        state = _make_state(data_dir=data_dir)
+        await state.initialize()
+        await state.shutdown()
+        # Should not fail even with empty records
+        records_dir = Path(data_dir) / "records"
+        assert records_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_load_records_nonexistent_dir(self, tmp_path: Path) -> None:
+        state = _make_state(data_dir=str(tmp_path / "nope"))
+        state._load_persisted_records()  # should not raise
+        assert len(state.records) == 0
+
+    def test_store_permission_token(self) -> None:
+        from polis_node.attribution.record import PermissionToken
+        state = _make_state()
+        token = PermissionToken(
+            record_cid="test-cid",
+            recipient_did="did:polis:r",
+            grantor_did="did:polis:g",
+            wrapped_key=b"\x01" * 32,
+            wrap_nonce=b"\x02" * 12,
+            record_salt=b"\x03" * 16,
+            record_nonce=b"\x04" * 12,
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        state.store_permission_token(token)
+        assert state.get_permission_token(token.token_id) is token
+        assert state.get_permission_token("nonexistent") is None
