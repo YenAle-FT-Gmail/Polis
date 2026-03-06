@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import time
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -17,12 +20,21 @@ import structlog
 
 from polis_node.config.settings import PolisNodeSettings
 from polis_node.identity.did import DIDResolver, PolisIdentity
+from polis_node.identity.persistence import save_identity, load_identity
 from polis_node.attribution.record import AttributionRecord
 from polis_node.storage.interface import StorageBackend
 from polis_node.storage.local import LocalStorageBackend
+from polis_node.moderation.engine import ModerationEngine
 
 
 logger = structlog.get_logger(__name__)
+
+# Maximum payload size in bytes (10 MiB)
+MAX_PAYLOAD_SIZE: int = 10 * 1024 * 1024
+
+# Default page size for paginated endpoints
+DEFAULT_PAGE_SIZE: int = 50
+MAX_PAGE_SIZE: int = 200
 
 
 class NodeState:
@@ -37,6 +49,7 @@ class NodeState:
         storage: Active storage backend.
         identities: Mapping of DID -> PolisIdentity (in-memory for v0.1).
         records: Mapping of CID -> AttributionRecord (in-memory index).
+        moderation: Content moderation engine.
     """
 
     def __init__(self, settings: PolisNodeSettings) -> None:
@@ -52,6 +65,8 @@ class NodeState:
         self.records: dict[str, AttributionRecord] = {}
         self.record_data: dict[str, bytes] = {}  # CID -> raw payload/ciphertext
         self.peers: list[str] = list(settings.peers)  # Mutable copy of initial peers
+        self.moderation = ModerationEngine()
+        self._started_at: float = time.monotonic()
 
     def _create_storage_backend(self) -> StorageBackend:
         """Create the storage backend based on configuration.
@@ -81,13 +96,54 @@ class NodeState:
     async def initialize(self) -> None:
         """Initialize the node state (called during application startup).
 
-        Sets up the storage directory and initial peer connections.
+        Loads persisted identities from disk and sets up storage.
         """
         logger.info(
             "node_state.initialize",
             node_id=self.settings.node_id,
             storage_backend=self.settings.storage_backend,
         )
+        self._started_at = time.monotonic()
+        # Load persisted identities from encrypted files
+        self._load_persisted_identities()
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown — persist state before exit."""
+        logger.info("node_state.shutdown", identity_count=len(self.identities))
+        self._persist_identities()
+
+    def _load_persisted_identities(self) -> None:
+        """Load all encrypted identity files from POLIS_IDENTITY_DIR."""
+        identity_dir = Path(self.settings.identity_dir)
+        if not identity_dir.exists():
+            return
+        passphrase = self.settings.identity_passphrase
+        if not passphrase:
+            logger.warning("node_state.no_passphrase", msg="POLIS_IDENTITY_PASSPHRASE not set; skipping identity restore")
+            return
+        for fp in identity_dir.glob("*.json"):
+            try:
+                ident = load_identity(fp, passphrase)
+                self.identities[ident.did] = ident
+                self.resolver.register(ident)
+                logger.info("identity.restored", did=ident.did)
+            except Exception as exc:
+                logger.error("identity.restore_failed", path=str(fp), error=str(exc))
+
+    def _persist_identities(self) -> None:
+        """Persist all identities as encrypted files."""
+        passphrase = self.settings.identity_passphrase
+        if not passphrase:
+            logger.warning("node_state.no_passphrase", msg="Skipping identity persistence")
+            return
+        identity_dir = Path(self.settings.identity_dir)
+        identity_dir.mkdir(parents=True, exist_ok=True)
+        for did, ident in self.identities.items():
+            try:
+                fp = identity_dir / f"{did.replace(':', '_')}.json"
+                save_identity(ident, fp, passphrase)
+            except Exception as exc:
+                logger.error("identity.persist_failed", did=did, error=str(exc))
 
     def register_identity(self, identity: PolisIdentity) -> None:
         """Register a new identity in the node state.
@@ -148,16 +204,48 @@ class NodeState:
         """
         return self.records.get(cid)
 
-    def get_records_by_author(self, did: str) -> list[AttributionRecord]:
-        """Get all records by a specific author DID.
+    def get_records_by_author(
+        self, did: str, *, offset: int = 0, limit: int = DEFAULT_PAGE_SIZE
+    ) -> list[AttributionRecord]:
+        """Get paginated records by a specific author DID.
 
         Args:
             did: The author's DID.
+            offset: Number of records to skip.
+            limit: Maximum number of records to return.
 
         Returns:
             List of AttributionRecords authored by the given DID.
         """
-        return [r for r in self.records.values() if r.author_did == did]
+        limit = min(limit, MAX_PAGE_SIZE)
+        all_records = [r for r in self.records.values() if r.author_did == did]
+        return all_records[offset : offset + limit]
+
+    def get_health_status(self) -> dict:
+        """Assess actual node health.
+
+        Returns:
+            A dict with status, uptime, and component checks.
+        """
+        uptime = time.monotonic() - self._started_at
+        storage_ok = self.storage is not None
+        identity_count = len(self.identities)
+        record_count = len(self.records)
+
+        status = "healthy"
+        if not storage_ok:
+            status = "degraded"
+        if identity_count == 0 and record_count == 0 and uptime > 60:
+            status = "idle"
+
+        return {
+            "status": status,
+            "uptime_seconds": round(uptime, 1),
+            "storage_ok": storage_ok,
+            "identity_count": identity_count,
+            "record_count": record_count,
+            "peer_count": len(self.peers),
+        }
 
     async def propagate_record(
         self, record: AttributionRecord, storable_data: bytes
@@ -192,10 +280,11 @@ class NodeState:
             )
             url = f"{scheme}://{peer}/records/ingest"
             try:
+                headers = self._make_signed_headers("POST", url)
                 async with httpx.AsyncClient(
                     verify=scheme == "https", timeout=10.0
                 ) as client:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json=payload, headers=headers)
                     if resp.status_code == 200:
                         results[peer] = "ok"
                     else:
@@ -210,3 +299,66 @@ class NodeState:
                 results[peer] = f"error: {exc}"
 
         return results
+
+    # ------------------------------------------------------------------
+    # Inter-node request signing helpers
+    # ------------------------------------------------------------------
+
+    def _make_signed_headers(self, method: str, url: str) -> dict[str, str]:
+        """Create signed headers for outgoing inter-node requests (Inv 21)."""
+        if not self.identities:
+            return {}
+        node_identity = next(iter(self.identities.values()))
+        ts = str(int(time.time()))
+        message = f"{method}|{url}|{ts}".encode("utf-8")
+        signature = node_identity.sign(message)
+        return {
+            "X-Polis-Node-DID": node_identity.did,
+            "X-Polis-Timestamp": ts,
+            "X-Polis-Signature": signature.hex(),
+        }
+
+    def verify_inter_node_signature(
+        self,
+        method: str,
+        url: str,
+        node_did: str,
+        timestamp: str,
+        signature_hex: str,
+        *,
+        max_age_seconds: int = 300,
+    ) -> bool:
+        """Verify a signed inter-node request (Invariant 21).
+
+        Args:
+            method: HTTP method.
+            url: The target URL.
+            node_did: The claiming node's DID.
+            timestamp: Unix timestamp string from the header.
+            signature_hex: Hex-encoded Ed25519 signature.
+            max_age_seconds: Maximum age of the timestamp (replay window).
+
+        Returns:
+            True if the signature is valid and fresh, False otherwise.
+        """
+        # Replay protection: reject stale timestamps
+        try:
+            ts = int(timestamp)
+        except (ValueError, TypeError):
+            return False
+        if abs(time.time() - ts) > max_age_seconds:
+            return False
+
+        # Resolve the signing public key for the node DID
+        pub_key_bytes = self.resolver.get_signing_public_key(node_did)
+        if pub_key_bytes is None:
+            return False
+
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        message = f"{method}|{url}|{timestamp}".encode("utf-8")
+        try:
+            pub = Ed25519PublicKey.from_public_bytes(pub_key_bytes)
+            pub.verify(bytes.fromhex(signature_hex), message)
+            return True
+        except Exception:
+            return False

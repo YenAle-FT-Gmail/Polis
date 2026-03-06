@@ -73,11 +73,12 @@ class NodeStatusResponse(BaseModel):
 
     Attributes:
         node_id: This node's identifier.
-        status: Node status (healthy, degraded, etc.).
+        status: Node status (healthy, degraded, idle).
         storage_backend: Active storage backend type.
         identity_count: Number of registered identities.
         record_count: Number of stored attribution records.
         peer_count: Number of connected peers.
+        uptime_seconds: Seconds since the node started.
     """
 
     node_id: str
@@ -86,6 +87,7 @@ class NodeStatusResponse(BaseModel):
     identity_count: int
     record_count: int
     peer_count: int
+    uptime_seconds: float = 0.0
 
 
 class PeerInfo(BaseModel):
@@ -132,13 +134,15 @@ async def node_status(
     Returns:
         Node status including identity count, record count, and peer info.
     """
+    health = state.get_health_status()
     return NodeStatusResponse(
         node_id=state.settings.node_id,
-        status="healthy",
+        status=health["status"],
         storage_backend=state.settings.storage_backend,
-        identity_count=len(state.identities),
-        record_count=len(state.records),
-        peer_count=len(state.peers),
+        identity_count=health["identity_count"],
+        record_count=health["record_count"],
+        peer_count=health["peer_count"],
+        uptime_seconds=health["uptime_seconds"],
     )
 
 

@@ -225,15 +225,19 @@ class TestRecordAPI:
 
         response = client.get(f"/records/by-author/{did}")
         assert response.status_code == 200
-        records = response.json()
-        assert len(records) == 3
-        assert all(r["author_did"] == did for r in records)
+        body = response.json()
+        assert body["total"] == 3
+        assert body["offset"] == 0
+        assert len(body["records"]) == 3
+        assert all(r["author_did"] == did for r in body["records"])
 
     def test_get_records_by_unknown_author(self, client: TestClient) -> None:
-        """GET /records/by-author/{did} returns empty list for unknown author."""
+        """GET /records/by-author/{did} returns empty for unknown author."""
         response = client.get("/records/by-author/did:polis:unknown")
         assert response.status_code == 200
-        assert response.json() == []
+        body = response.json()
+        assert body["records"] == []
+        assert body["total"] == 0
 
 
 # ---------------------------------------------------------------------------

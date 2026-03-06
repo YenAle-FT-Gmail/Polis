@@ -11,7 +11,7 @@ import base64
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from polis_node.api.dependencies import get_node_state
@@ -45,10 +45,10 @@ class CreateRecordRequest(BaseModel):
         visibility: Record visibility level.
     """
 
-    payload: str = Field(description="Base64-encoded payload data")
-    author_did: str = Field(description="The author's Polis DID")
-    record_type: str = Field(default="polis.content.post", description="Namespaced record type")
-    visibility: str = Field(default="public", description="Record visibility: public, private, or selective")
+    payload: str = Field(description="Base64-encoded payload data", max_length=14_000_000)
+    author_did: str = Field(description="The author's Polis DID", max_length=256)
+    record_type: str = Field(default="polis.content.post", description="Namespaced record type", max_length=256)
+    visibility: str = Field(default="public", description="Record visibility: public, private, or selective", max_length=20)
 
 
 class IngestRecordRequest(BaseModel):
@@ -207,6 +207,20 @@ async def create_record(
             },
         )
 
+    # --- Moderation pre-screening (Invariant 6) ---
+    from polis_node.moderation.engine import ModerationVerdict
+    is_encrypted = request.visibility in ("private", "selective")
+    mod_result = state.moderation.screen(payload, is_encrypted=is_encrypted)
+    if mod_result.verdict == ModerationVerdict.REJECT:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "content_rejected",
+                "reason": mod_result.reason.value if mod_result.reason else "unknown",
+                "message": mod_result.details or "Content rejected by moderation engine.",
+            },
+        )
+
     try:
         record, storable_data = AttributionRecord.create(
             payload=payload,
@@ -291,23 +305,33 @@ async def get_record(
 @router.get(
     "/by-author/{did}",
     summary="List records by author",
-    description="Retrieve all attribution records by a specific author DID.",
+    description="Retrieve attribution records by a specific author DID (paginated).",
 )
 async def get_records_by_author(
     did: str,
+    offset: int = 0,
+    limit: int = 50,
     state: NodeState = Depends(get_node_state),
-) -> list[dict]:
-    """List all records by a specific author DID.
+) -> dict:
+    """List records by a specific author DID with pagination.
 
     Args:
         did: The author's DID.
+        offset: Number of records to skip.
+        limit: Maximum number of records to return (max 200).
         state: Injected node state.
 
     Returns:
-        A list of attribution records as dicts.
+        A paginated response with records and metadata.
     """
-    records = state.get_records_by_author(did)
-    return [r.to_dict() for r in records]
+    records = state.get_records_by_author(did, offset=max(0, offset), limit=min(limit, 200))
+    total = len([r for r in state.records.values() if r.author_did == did])
+    return {
+        "records": [r.to_dict() for r in records],
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+    }
 
 
 @router.post(
@@ -463,6 +487,7 @@ async def revoke_access(
 )
 async def ingest_record(
     request: IngestRecordRequest,
+    raw_request: Request,
     state: NodeState = Depends(get_node_state),
 ) -> dict:
     """Ingest an externally-created attribution record.
@@ -471,8 +496,12 @@ async def ingest_record(
     The receiving node re-verifies the signature independently
     before storing (Invariant 8, 22).
 
+    If X-Polis-Node-DID / X-Polis-Signature / X-Polis-Timestamp headers
+    are present, the inter-node signature is verified (Invariant 21).
+
     Args:
         request: The ingest request containing the record and data.
+        raw_request: The raw HTTP request (for header inspection).
         state: Injected node state.
 
     Returns:
@@ -480,7 +509,23 @@ async def ingest_record(
 
     Raises:
         HTTPException: 400 if the record is invalid or signature fails.
+        HTTPException: 403 if inter-node signature verification fails.
     """
+
+    # --- Inter-node signature verification (Invariant 21) ---
+    node_did = raw_request.headers.get("X-Polis-Node-DID")
+    node_ts = raw_request.headers.get("X-Polis-Timestamp")
+    node_sig = raw_request.headers.get("X-Polis-Signature")
+    if node_did and node_ts and node_sig:
+        url = str(raw_request.url)
+        if not state.verify_inter_node_signature("POST", url, node_did, node_ts, node_sig):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "invalid_node_signature",
+                    "message": "Inter-node request signature verification failed.",
+                },
+            )
 
     try:
         record = AttributionRecord.from_dict(request.record)

@@ -52,10 +52,13 @@ class PolisNodeSettings:
         port: Port number for the API server.
         storage_backend: Storage backend type (local | ipfs | arweave).
         data_dir: Local filesystem path for node data.
+        identity_dir: Directory for encrypted identity files.
         peers: Comma-separated list of peer addresses.
         log_level: Structured logging level (DEBUG, INFO, WARNING, ERROR).
         ipfs_api_url: URL of the local IPFS HTTP API (if using IPFS backend).
         arweave_gateway_url: URL of the Arweave gateway (if using Arweave backend).
+        cors_origins: Allowed CORS origins (comma-separated).
+        identity_passphrase: Passphrase for encrypting identity files at rest.
     """
 
     node_id: str = "polis-node"
@@ -63,10 +66,13 @@ class PolisNodeSettings:
     port: int = DEFAULT_PORT
     storage_backend: str = DEFAULT_STORAGE_BACKEND
     data_dir: str = DEFAULT_DATA_DIR
+    identity_dir: str = "/tmp/polis/identities"
     peers: list[str] = field(default_factory=list)
     log_level: str = DEFAULT_LOG_LEVEL
     ipfs_api_url: str = "http://localhost:5001"
     arweave_gateway_url: str = "https://arweave.net"
+    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    identity_passphrase: str = ""
 
     @classmethod
     def from_env(cls) -> PolisNodeSettings:
@@ -89,16 +95,22 @@ class PolisNodeSettings:
         peers_raw = os.environ.get("POLIS_PEERS", "")
         peers = [p.strip() for p in peers_raw.split(",") if p.strip()]
 
+        cors_raw = os.environ.get("POLIS_CORS_ORIGINS", "*")
+        cors_origins = [o.strip() for o in cors_raw.split(",") if o.strip()]
+
         return cls(
             node_id=os.environ.get("POLIS_NODE_ID", "polis-node"),
             host=os.environ.get("POLIS_HOST", DEFAULT_HOST),
             port=int(os.environ.get("POLIS_PORT", str(DEFAULT_PORT))),
             storage_backend=os.environ.get("POLIS_STORAGE_BACKEND", DEFAULT_STORAGE_BACKEND),
             data_dir=os.environ.get("POLIS_DATA_DIR", DEFAULT_DATA_DIR),
+            identity_dir=os.environ.get("POLIS_IDENTITY_DIR", "/tmp/polis/identities"),
             peers=peers,
             log_level=os.environ.get("POLIS_LOG_LEVEL", DEFAULT_LOG_LEVEL),
             ipfs_api_url=os.environ.get("POLIS_IPFS_API_URL", "http://localhost:5001"),
             arweave_gateway_url=os.environ.get(
                 "POLIS_ARWEAVE_GATEWAY_URL", "https://arweave.net"
             ),
+            cors_origins=cors_origins,
+            identity_passphrase=os.environ.get("POLIS_IDENTITY_PASSPHRASE", ""),
         )

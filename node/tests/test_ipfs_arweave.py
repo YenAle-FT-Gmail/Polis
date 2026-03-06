@@ -201,10 +201,36 @@ class TestArweaveBackend:
         assert backend.gateway_url == "https://arweave.net"
 
     @pytest.mark.asyncio
-    async def test_put_raises_not_implemented(self) -> None:
-        backend = ArweaveBackend()
-        with pytest.raises(NotImplementedError, match="not yet implemented"):
-            await backend.put(b"data")
+    async def test_put_success(self) -> None:
+        backend = ArweaveBackend("https://fake-arweave")
+        client = _mock_client_post(_fake_response(status_code=202))
+        with patch("polis_node.storage.arweave.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            cid = await backend.put(b"data")
+        assert cid  # returns a CID string
+
+    @pytest.mark.asyncio
+    async def test_put_gateway_rejected_returns_cid(self) -> None:
+        """When gateway rejects, put() still returns the local CID."""
+        backend = ArweaveBackend("https://fake-arweave")
+        client = _mock_client_post(_fake_response(status_code=400))
+        with patch("polis_node.storage.arweave.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            cid = await backend.put(b"data")
+        assert cid == StorageBackend.compute_cid(b"data")
+
+    @pytest.mark.asyncio
+    async def test_put_gateway_unreachable_returns_cid(self) -> None:
+        """When gateway is down, put() still returns the local CID."""
+        backend = ArweaveBackend("https://fake-arweave")
+        client = _mock_client_post(httpx.ConnectError("refused"))
+        with patch("polis_node.storage.arweave.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            cid = await backend.put(b"data")
+        assert cid == StorageBackend.compute_cid(b"data")
 
     @pytest.mark.asyncio
     async def test_get_success(self) -> None:

@@ -36,6 +36,13 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
+[tool.coverage.run]
+source = ["polis_node"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
 [tool.black]
 line-length = 100
 target-version = ["py311"]

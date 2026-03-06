@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Python (node + client)
+  # -----------------------------------------------------------------------
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install node dependencies
+        working-directory: node
+        run: poetry install --no-interaction
+
+      - name: Lint (ruff)
+        working-directory: node
+        run: poetry run ruff check polis_node tests
+
+      - name: Format check (black)
+        working-directory: node
+        run: poetry run black --check polis_node tests
+
+      - name: Type check (mypy)
+        working-directory: node
+        run: poetry run mypy polis_node --ignore-missing-imports
+        continue-on-error: true  # promote to required once all stubs typed
+
+      - name: Tests + coverage
+        working-directory: node
+        run: poetry run pytest --cov=polis_node --cov-fail-under=80 -q
+
+  # -----------------------------------------------------------------------
+  # Rust (crypto crate)
+  # -----------------------------------------------------------------------
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format check
+        working-directory: crypto
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        working-directory: crypto
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
+
+      - name: Tests
+        working-directory: crypto
+        run: cargo test
+
+  # -----------------------------------------------------------------------
+  # Docker build smoke-test
+  # -----------------------------------------------------------------------
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build node image
+        run: docker build -f docker/Dockerfile.node -t polis-node:ci .

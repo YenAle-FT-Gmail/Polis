@@ -266,6 +266,25 @@ class PolisIdentity:
         signing_key_b58 = base58.b58encode(self.signing_key_public).decode("ascii")
         recovery_key_b58 = base58.b58encode(self.recovery_key_public).decode("ascii")
 
+        # Derive an X25519 key-agreement public key from the signing key
+        from polis_node.attribution.record import _ed25519_public_to_x25519
+        try:
+            x25519_pub = _ed25519_public_to_x25519(self.signing_key_public)
+            from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+            x25519_pub_b58 = base58.b58encode(
+                x25519_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+            ).decode("ascii")
+            key_agreement_entry = [
+                {
+                    "id": f"{self.did}#key-agreement",
+                    "type": "X25519KeyAgreementKey2020",
+                    "controller": self.did,
+                    "publicKeyBase58": x25519_pub_b58,
+                }
+            ]
+        except Exception:
+            key_agreement_entry = []
+
         doc: dict = {
             "@context": list(DID_DOCUMENT_CONTEXT),
             "id": self.did,
@@ -288,7 +307,7 @@ class PolisIdentity:
             "authentication": [f"{self.did}#signing-key"],
             "assertionMethod": [f"{self.did}#signing-key"],
             "capabilityDelegation": [f"{self.did}#signing-key"],
-            "keyAgreement": [],
+            "keyAgreement": key_agreement_entry,
         }
 
         if self.storage_endpoint:
